@@ -13,7 +13,16 @@ import {
 } from "./Components/AddonEntry";
 import { summariseAddons, formatRate } from "./utils/addonGst";
 import { roomGstRate, roomGstPercent } from "./utils/billing";
+import {
+  BOOKING_CHANNELS,
+  OTHER_CHANNEL,
+  CHANNEL_MAX,
+  NOT_RECORDED,
+  channelOf,
+  channelBadgeClass,
+} from "./utils/bookingChannel";
 import FolioPanel from "./Components/FolioPanel";
+import ExtendStayModal from "./Components/ExtendStayModal";
 
 const API = process.env.REACT_APP_API_URL;
 
@@ -463,6 +472,108 @@ const [now, setNow] = useState(Date.now());
   const { catalog: addonCatalog } = useAddonCatalog(apiFetch);
 
   const toast = showToast || (() => {});
+
+  /* EXTEND STAY / LATE CHECK-OUT
+   * extendMode: null, { mode: "planned" } or { mode: "overstay", overstay }
+   * overstayInfo: set when the guest has stayed a full 24 hours (or more)
+   * past the due-out time — shown as a banner so the extra nights are added
+   * BEFORE the balance is collected, not after. */
+  const [extendMode, setExtendMode] = useState(null);
+  const [overstayInfo, setOverstayInfo] = useState(null);
+  const apiRef = useRef(apiFetch);
+  apiRef.current = apiFetch;
+
+  // null when there is nothing to add, or the server is an older version
+  async function fetchOverstay() {
+    try {
+      const res = await apiRef.current(`/api/bookings/${bookingId}/overstay`);
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data && data.extra_nights > 0 ? data : null;
+    } catch {
+      return null;
+    }
+  }
+
+  useEffect(() => {
+    const active =
+      booking?.actual_checkin &&
+      !booking?.actual_checkout &&
+      String(booking?.status || "").toLowerCase() === "confirmed";
+    if (!active) {
+      setOverstayInfo(null);
+      return undefined;
+    }
+    let cancelled = false;
+    fetchOverstay().then((data) => {
+      if (!cancelled) setOverstayInfo(data);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    bookingId,
+    booking?.actual_checkin,
+    booking?.actual_checkout,
+    booking?.check_out_date,
+    booking?.status,
+  ]);
+
+  function afterExtend() {
+    setExtendMode(null);
+    setOverstayInfo(null);
+    fetchBooking();
+    onRefresh && onRefresh();
+  }
+
+  /* booking source — null while not being edited */
+  const [channelEdit, setChannelEdit] = useState(null);
+  const [channelSaving, setChannelSaving] = useState(false);
+
+  function startChannelEdit(current) {
+    if (!current || current === NOT_RECORDED) {
+      setChannelEdit({ value: "", other: "" });
+    } else if (BOOKING_CHANNELS.includes(current)) {
+      setChannelEdit({ value: current, other: "" });
+    } else {
+      // Website, Bulk Booking or a typed name — edit it as text
+      setChannelEdit({ value: OTHER_CHANNEL, other: current });
+    }
+  }
+
+  // a label only: changes no amount, payment or status
+  async function saveBookingChannel() {
+    const value =
+      channelEdit.value === OTHER_CHANNEL
+        ? channelEdit.other.trim()
+        : channelEdit.value;
+    if (!value) return toast("Select a booking source", "error");
+
+    setChannelSaving(true);
+    try {
+      const res = await apiFetch(
+        `/api/bookings/${bookingId}/booking-channel`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ booking_channel: value }),
+        },
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok)
+        throw new Error(data.error || "Could not update booking source");
+
+      setBooking((prev) =>
+        prev ? { ...prev, booking_channel: data.booking_channel } : prev,
+      );
+      setChannelEdit(null);
+      toast("Booking source updated", "success");
+    } catch (err) {
+      toast(err.message, "error");
+    } finally {
+      setChannelSaving(false);
+    }
+  }
 
   /* ── fetch booking ─────────────────────────────────────────────────────── */
 
@@ -1148,6 +1259,15 @@ const [now, setNow] = useState(Date.now());
   /* ── checkout ──────────────────────────────────────────────────────────── */
 
   async function handleCheckout() {
+    // LATE CHECK-OUT — every full 24 hours past the due-out time is billed
+    // before the stay can close
+    const late = await fetchOverstay();
+    if (late) {
+      setOverstayInfo(late);
+      setExtendMode({ mode: "overstay", overstay: late });
+      return;
+    }
+
     if (
       unpaidAddons.length > 0 ||
       finalRemaining > 0
@@ -1575,6 +1695,77 @@ const roomTotalWithGst = Math.max(
     .filter(Boolean)
     .join(", ");
 
+  // where the guest booked from, with an inline editor
+  const channelLabel = channelOf(b);
+  const channelNode = channelEdit ? (
+    <span className="flex flex-wrap items-center justify-end gap-1.5">
+      <select
+        value={channelEdit.value}
+        onChange={(e) =>
+          setChannelEdit((prev) => ({ ...prev, value: e.target.value }))
+        }
+        className="rounded border border-gray-300 bg-white px-1.5 py-1 text-[0.72rem] font-medium text-navy outline-none focus:border-[#C9A84C]"
+      >
+        <option value="" disabled>
+          Select…
+        </option>
+        {BOOKING_CHANNELS.map((c) => (
+          <option key={c} value={c}>
+            {c}
+          </option>
+        ))}
+        <option value={OTHER_CHANNEL}>Other</option>
+      </select>
+
+      {channelEdit.value === OTHER_CHANNEL && (
+        <input
+          value={channelEdit.other}
+          maxLength={CHANNEL_MAX}
+          autoFocus
+          onChange={(e) =>
+            setChannelEdit((prev) => ({ ...prev, other: e.target.value }))
+          }
+          placeholder="Source name"
+          className="w-[120px] rounded border border-gray-300 px-1.5 py-1 text-[0.72rem] font-medium text-navy outline-none focus:border-[#C9A84C]"
+        />
+      )}
+
+      <button
+        type="button"
+        onClick={saveBookingChannel}
+        disabled={channelSaving}
+        className="rounded bg-navy px-2 py-1 text-[0.65rem] font-bold text-white disabled:opacity-50"
+      >
+        {channelSaving ? "Saving…" : "Save"}
+      </button>
+      <button
+        type="button"
+        onClick={() => setChannelEdit(null)}
+        disabled={channelSaving}
+        className="rounded border border-gray-300 bg-white px-2 py-1 text-[0.65rem] font-semibold text-gray-500"
+      >
+        Cancel
+      </button>
+    </span>
+  ) : (
+    <span className="inline-flex items-center gap-1.5">
+      <span
+        className={`rounded border px-1.5 py-[1px] text-[0.62rem] font-bold uppercase tracking-[0.5px] ${channelBadgeClass(
+          channelLabel,
+        )}`}
+      >
+        {channelLabel}
+      </span>
+      <button
+        type="button"
+        onClick={() => startChannelEdit(channelLabel)}
+        className="text-[0.65rem] font-semibold text-[#9A7A2E] hover:underline"
+      >
+        Edit
+      </button>
+    </span>
+  );
+
   const customerRows = [
     ["Name", b.guest_name],
     ["Email", b.email],
@@ -1585,6 +1776,7 @@ const roomTotalWithGst = Math.max(
         b.booking_id,
       ).padStart(6, "0")}`,
     ],
+    ["Booking Source", channelNode],
     [
       "Check-in Date",
       fmtDate(b.check_in_date),
@@ -2927,6 +3119,59 @@ const roomTotalWithGst = Math.max(
                 </div>
               )}
             </Card>
+
+            {/* Extend stay / late check-out */}
+
+            {!isCheckedOut &&
+              String(b.status || "").toLowerCase() === "confirmed" && (
+                <div className="space-y-2">
+                  {overstayInfo && (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-[0.74rem] leading-relaxed text-amber-900">
+                      <b>Late check-out:</b> stayed{" "}
+                      {overstayInfo.over_hours} hr past the due-out time —{" "}
+                      {overstayInfo.extra_nights} extra night
+                      {overstayInfo.extra_nights === 1 ? "" : "s"}
+                      {overstayInfo.plan
+                        ? ` (${money(overstayInfo.plan.extra_amount)})`
+                        : ""}{" "}
+                      to add before check-out.{" "}
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setExtendMode({
+                            mode: "overstay",
+                            overstay: overstayInfo,
+                          })
+                        }
+                        className="font-bold underline"
+                      >
+                        Add to bill
+                      </button>
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => setExtendMode({ mode: "planned" })}
+                    className="w-full rounded-lg border border-navy/25 bg-white py-2.5 text-[0.82rem] font-semibold text-navy transition hover:bg-navy/5"
+                  >
+                    ＋ Extend Stay
+                  </button>
+                </div>
+              )}
+
+            {extendMode && (
+              <ExtendStayModal
+                bookingId={bookingId}
+                currentCheckOut={b.check_out_date}
+                mode={extendMode.mode}
+                overstay={extendMode.overstay}
+                apiFetch={apiFetch}
+                toast={toast}
+                onClose={() => setExtendMode(null)}
+                onDone={afterExtend}
+              />
+            )}
 
             {/* Checkout */}
 

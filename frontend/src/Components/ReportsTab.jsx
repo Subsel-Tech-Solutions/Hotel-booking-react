@@ -1,5 +1,11 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { DownloadIcon } from "../Icons";
+import { formatStayTime } from "../utils/stayTime";
+import {
+  channelOf,
+  channelBadgeClass,
+  summariseBySource,
+} from "../utils/bookingChannel";
 
 /* ── REPORTS TAB ── */
 export default function ReportsTab({ apiFetch, showToast }) {
@@ -270,6 +276,28 @@ export default function ReportsTab({ apiFetch, showToast }) {
     );
 
     // ===================================================
+    // BY BOOKING SOURCE — bookings and revenue per source; adds up to the
+    // Total Revenue box. The first-page table starts just below it.
+    // ===================================================
+    const sourceText = summariseBySource(reportData.bookings)
+      .map(
+        (r) =>
+          `${r.label}: ${r.count} (Rs.${Number(r.revenue).toLocaleString()})`,
+      )
+      .join("    ");
+
+    const sourceLines = sourceText
+      ? doc.splitTextToSize(`By booking source —   ${sourceText}`, tableWidth)
+      : [];
+
+    sourceLines.forEach((line, i) => {
+      doc.text(line, marginX, infoY + 14 + i * 5);
+    });
+
+    const firstTableY =
+      infoY + 18 + (sourceLines.length ? sourceLines.length * 5 + 2 : 0);
+
+    // ===================================================
     // PDF TABLE COLUMN CONFIGURATION
     // ===================================================
     const columns = [
@@ -415,7 +443,7 @@ export default function ReportsTab({ apiFetch, showToast }) {
     // ===================================================
     drawPdfHeader();
 
-    let tableY = drawTableHeader(infoY + 18);
+    let tableY = drawTableHeader(firstTableY);
 
     // ===================================================
     // PDF BOOKINGS
@@ -456,6 +484,9 @@ export default function ReportsTab({ apiFetch, showToast }) {
         guestName = guestName.substring(0, 24) + "…";
       }
 
+      // where the guest booked from, printed under the name
+      const sourceLabel = channelOf(b);
+
       let roomType = b.room_type || "—";
 
       if (roomType.length > 16) {
@@ -465,6 +496,11 @@ export default function ReportsTab({ apiFetch, showToast }) {
       const checkIn = b.check_in_date ? b.check_in_date.slice(0, 10) : "—";
 
       const checkOut = b.check_out_date ? b.check_out_date.slice(0, 10) : "—";
+
+      // actual arrival / departure time, printed under the date
+      const checkInTime = formatStayTime(b.actual_checkin, b.check_in_date);
+
+      const checkOutTime = formatStayTime(b.actual_checkout, b.check_out_date);
 
       const baseAmount = Number(b.total_price || 0);
 
@@ -492,6 +528,8 @@ export default function ReportsTab({ apiFetch, showToast }) {
 
       columns.forEach((column) => {
         let value = "";
+        // second, smaller line under the value — the check-in/out time
+        let subValue = "";
         let align = column.align;
 
         switch (column.key) {
@@ -501,6 +539,7 @@ export default function ReportsTab({ apiFetch, showToast }) {
 
           case "guest":
             value = guestName;
+            subValue = sourceLabel;
             break;
 
           case "room":
@@ -509,10 +548,12 @@ export default function ReportsTab({ apiFetch, showToast }) {
 
           case "checkIn":
             value = checkIn;
+            subValue = checkInTime;
             break;
 
           case "checkOut":
             value = checkOut;
+            subValue = checkOutTime;
             break;
 
           case "base":
@@ -567,14 +608,23 @@ export default function ReportsTab({ apiFetch, showToast }) {
           textX = x + column.width / 2;
         }
 
-        doc.text(value, textX, tableY, {
-          align:
-            align === "right"
-              ? "right"
-              : align === "center"
-                ? "center"
-                : "left",
-        });
+        const textAlign =
+          align === "right" ? "right" : align === "center" ? "center" : "left";
+
+        if (subValue) {
+          // date on top, time underneath in smaller grey — both inside the
+          // same 10mm row, so the row height and page breaks are unchanged
+          doc.text(value, textX, tableY - 1.8, { align: textAlign });
+
+          doc.setFontSize(6);
+          doc.setFont("helvetica", "normal");
+          doc.setTextColor(...textGray);
+          doc.text(subValue, textX, tableY + 1.6, { align: textAlign });
+
+          doc.setFontSize(7);
+        } else {
+          doc.text(value, textX, tableY, { align: textAlign });
+        }
 
         x += column.width;
       });
@@ -774,6 +824,41 @@ export default function ReportsTab({ apiFetch, showToast }) {
             ))}
           </div>
 
+          {/* BY BOOKING SOURCE — adds up to the Total Revenue card */}
+          {reportData.bookings?.length > 0 && (
+            <div className="mb-5 rounded-xl border border-[#E9ECEF] bg-white px-[18px] py-4">
+              <div className="mb-3 text-[0.62rem] font-bold uppercase tracking-[1px] text-[#868E96]">
+                By booking source
+              </div>
+
+              <div className="flex flex-wrap gap-2.5">
+                {summariseBySource(reportData.bookings).map((r) => (
+                  <div
+                    key={r.label}
+                    className="min-w-[150px] rounded-lg border border-[#F1F3F5] bg-[#FAFBFC] px-3 py-2"
+                  >
+                    <span
+                      className={`inline-block rounded border px-1.5 py-[1px] text-[0.6rem] font-bold uppercase tracking-[0.5px] ${channelBadgeClass(
+                        r.label,
+                      )}`}
+                    >
+                      {r.label}
+                    </span>
+
+                    <div className="mt-1.5 flex items-baseline justify-between gap-3">
+                      <span className="text-[0.75rem] text-[#868E96]">
+                        {r.count} booking{r.count === 1 ? "" : "s"}
+                      </span>
+                      <span className="text-[0.9rem] font-semibold text-[#0F1923]">
+                        Rs.{Number(r.revenue).toLocaleString()}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* PDF DOWNLOAD */}
           <div className="mb-5">
             <button
@@ -850,6 +935,13 @@ export default function ReportsTab({ apiFetch, showToast }) {
 
                         <td className="px-3 py-2.5 text-center text-[0.82rem] font-semibold text-[#0F1923] whitespace-nowrap">
                           {b.guest_name}
+                          <span
+                            className={`mx-auto mt-1 block w-fit rounded border px-1.5 py-[1px] text-[0.58rem] font-bold uppercase tracking-[0.5px] ${channelBadgeClass(
+                              channelOf(b),
+                            )}`}
+                          >
+                            {channelOf(b)}
+                          </span>
                         </td>
 
                         <td className="px-3 py-2.5 text-center text-[0.78rem] text-[#495057]">
@@ -858,10 +950,23 @@ export default function ReportsTab({ apiFetch, showToast }) {
 
                         <td className="px-3 py-2.5 text-center text-[0.78rem] text-[#495057] whitespace-nowrap">
                           {b.check_in_date?.slice(0, 10)}
+                          {b.actual_checkin && (
+                            <span className="block text-[0.68rem] text-[#868E96]">
+                              {formatStayTime(b.actual_checkin, b.check_in_date)}
+                            </span>
+                          )}
                         </td>
 
                         <td className="px-3 py-2.5 text-center text-[0.78rem] text-[#495057] whitespace-nowrap">
                           {b.check_out_date?.slice(0, 10)}
+                          {b.actual_checkout && (
+                            <span className="block text-[0.68rem] text-[#868E96]">
+                              {formatStayTime(
+                                b.actual_checkout,
+                                b.check_out_date,
+                              )}
+                            </span>
+                          )}
                         </td>
 
                         <td className="px-3 py-2.5 text-center text-[0.78rem] text-[#495057] whitespace-nowrap">

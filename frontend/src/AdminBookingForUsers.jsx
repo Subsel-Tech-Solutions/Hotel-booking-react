@@ -17,10 +17,14 @@ import {
   nightlyRate as resolveNightlyRate,
   money2,
   GSTIN_PATTERN,
-  roomRateFromRoom,
-  roomPercentFromRoom,
+  roomPercentForTariff,
 } from "./utils/billing";
 import { formatRate } from "./utils/addonGst";
+import {
+  BOOKING_CHANNELS,
+  OTHER_CHANNEL,
+  CHANNEL_MAX,
+} from "./utils/bookingChannel";
 
 const ADVANCE_RATE = 0.3;
 const MANUAL_PAYMENT_MODES = ["Cash", "Online", "Other"];
@@ -176,6 +180,16 @@ export default function AdminBookingForUsers({
 
     discount_applied: false,
     discount_amount: "",
+
+    // where the guest booked from — required, deliberately no default
+    booking_channel: "",
+    booking_channel_other: "",
+
+    // CUSTOM ROOM RATE per night — empty = the room's own price.
+    // Two linked boxes so the desk can type whichever figure the booking
+    // site shows: before GST, or including GST.
+    custom_rate: "",
+    custom_rate_incl: "",
   });
 
   const [occupiedNights, setOccupiedNights] = useState(new Set());
@@ -189,6 +203,13 @@ export default function AdminBookingForUsers({
 
   const [fieldErrors, setFieldErrors] = useState({});
   const [paying, setPaying] = useState(false);
+
+  // the source sent with the booking: a list choice, or the typed name
+  // when "Other" is picked
+  const bookingChannel =
+    form.booking_channel === OTHER_CHANNEL
+      ? form.booking_channel_other.trim()
+      : form.booking_channel;
 
   /* -----------------------------------------------------------
    * LOAD BOOKED DATES
@@ -433,7 +454,8 @@ export default function AdminBookingForUsers({
         )
       : 0;
 
-  const nightlyRate = useMemo(
+  // the room's own price at this occupancy
+  const roomNightlyRate = useMemo(
     () =>
       resolveNightlyRate(
         room,
@@ -441,6 +463,33 @@ export default function AdminBookingForUsers({
       ),
     [room, form.guest_count],
   );
+
+  /*
+   * CUSTOM ROOM RATE — any booking source except Walk-in may be sold at a
+   * different price (Booking.com, Agoda… sell above the room price). The
+   * server refuses a custom rate on a Walk-in too; this only mirrors it.
+   */
+  const rateEditable =
+    !!form.booking_channel &&
+    form.booking_channel !== "Walk-in";
+
+  const customRateValue = Number(form.custom_rate);
+  const customRateValid =
+    form.custom_rate !== "" &&
+    Number.isFinite(customRateValue) &&
+    customRateValue > 0;
+
+  // sent to the server only when it really differs from the room price
+  const customRateToSend =
+    rateEditable &&
+    customRateValid &&
+    Math.abs(money2(customRateValue) - money2(roomNightlyRate)) >= 0.01
+      ? money2(customRateValue)
+      : null;
+
+  // the rate this booking is priced at — every figure below follows it
+  const nightlyRate =
+    customRateToSend != null ? customRateToSend : roomNightlyRate;
 
   /*
    * The rate this ROOM is configured at. A booking does not exist yet, so
@@ -453,15 +502,50 @@ export default function AdminBookingForUsers({
    * and double, and the server decides the same way — if these disagree, the
    * desk quotes a figure the backend then charges differently.
    */
-  const roomGstMultiplier = useMemo(
-    () => roomRateFromRoom(room, form.guest_count),
-    [room, form.guest_count],
+  // the slab follows the price actually charged — the same rule as the
+  // server; for the room's own price this is exactly the room's rate
+  const roomGstLabel = useMemo(
+    () => roomPercentForTariff(room, nightlyRate),
+    [room, nightlyRate],
   );
 
-  const roomGstLabel = useMemo(
-    () => roomPercentFromRoom(room, form.guest_count),
-    [room, form.guest_count],
-  );
+  const roomGstMultiplier = roomGstLabel / 100;
+
+  // typing in one rate box fills the other
+  function setRate(kind, value) {
+    const clean = String(value).replace(/[^\d.]/g, "");
+    setFieldErrors((prev) => ({ ...prev, custom_rate: undefined }));
+    setForm((prev) => {
+      if (clean === "") {
+        return { ...prev, custom_rate: "", custom_rate_incl: "" };
+      }
+      const n = Number(clean);
+      if (!Number.isFinite(n)) {
+        return kind === "base"
+          ? { ...prev, custom_rate: clean }
+          : { ...prev, custom_rate_incl: clean };
+      }
+      if (kind === "base") {
+        const pct = roomPercentForTariff(room, n);
+        return {
+          ...prev,
+          custom_rate: clean,
+          custom_rate_incl: String(money2(n * (1 + pct / 100))),
+        };
+      }
+      // incl. GST → before GST; the slab depends on the result, so try the
+      // lower slab first and fall back to the upper one
+      const candidates = [
+        roomPercentForTariff(room, 0),
+        roomPercentForTariff(room, Number.MAX_SAFE_INTEGER),
+      ];
+      let base = money2(n / (1 + candidates[0] / 100));
+      if (roomPercentForTariff(room, base) !== candidates[0]) {
+        base = money2(n / (1 + candidates[1] / 100));
+      }
+      return { ...prev, custom_rate_incl: clean, custom_rate: String(base) };
+    });
+  }
 
   const totals = useMemo(() => {
     const bill = computeRoomBill({
@@ -650,6 +734,37 @@ const remainingAmount = Math.max(
         Object.values(customerErrors)[0],
         "error",
       );
+
+      return false;
+    }
+
+    // CUSTOM ROOM RATE — if typed, it must be a real price
+    if (rateEditable && form.custom_rate !== "" && !customRateValid) {
+      setFieldErrors((prev) => ({
+        ...prev,
+        custom_rate: "Enter a valid room rate",
+      }));
+      showToast("Enter a valid room rate", "error");
+      return false;
+    }
+
+    // BOOKING SOURCE — required for every desk booking
+    if (!bookingChannel) {
+      const field =
+        form.booking_channel === OTHER_CHANNEL
+          ? "booking_channel_other"
+          : "booking_channel";
+      const message =
+        form.booking_channel === OTHER_CHANNEL
+          ? "Type where this booking came from"
+          : "Select where this booking came from";
+
+      setFieldErrors((prev) => ({
+        ...prev,
+        [field]: message,
+      }));
+
+      showToast(message, "error");
 
       return false;
     }
@@ -910,6 +1025,12 @@ const remainingAmount = Math.max(
               totals.discountAmount,
 
             gst_enabled: true,
+
+            booking_channel:
+              bookingChannel,
+
+            custom_nightly_rate:
+              customRateToSend,
           }),
         },
       );
@@ -1015,6 +1136,12 @@ const remainingAmount = Math.max(
                           form.customer_address.trim() ||
                           null,
                       },
+
+                      booking_channel:
+                        bookingChannel,
+
+                      custom_nightly_rate:
+                        customRateToSend,
 
                       vehicle_type:
                         form.vehicle_type,
@@ -1182,6 +1309,12 @@ const remainingAmount = Math.max(
             form.customer_address.trim() ||
             null,
         },
+
+        booking_channel:
+          bookingChannel,
+
+        custom_nightly_rate:
+          customRateToSend,
 
         vehicle_type:
           form.vehicle_type,
@@ -1553,6 +1686,179 @@ console.log("DEBUG advance:", JSON.stringify(form.advance_amount), typeof form.a
             </div>
 
             <div className="grid grid-cols-1 gap-x-3 gap-y-3 sm:grid-cols-2">
+
+              {/* BOOKING SOURCE — required, no default so it is never
+                  recorded wrong by accident */}
+
+              <div
+                className={
+                  form.booking_channel === OTHER_CHANNEL
+                    ? ""
+                    : "sm:col-span-2"
+                }
+              >
+                <label className="mb-1 block text-[0.65rem] font-bold uppercase tracking-[1px] text-[#868E96]">
+                  Booking source *
+                </label>
+
+                <select
+                  value={form.booking_channel}
+                  onChange={(e) =>
+                    update(
+                      "booking_channel",
+                      e.target.value,
+                    )
+                  }
+                  className={`w-full rounded-md border bg-white px-3 py-2.5 text-sm outline-none ${
+                    fieldErrors.booking_channel
+                      ? "border-[#C0392B] focus:border-[#C0392B]"
+                      : "border-[#E9ECEF] focus:border-[#C9A84C]"
+                  } ${
+                    form.booking_channel
+                      ? "text-[#0F1923]"
+                      : "text-[#ADB5BD]"
+                  }`}
+                >
+                  <option value="" disabled>
+                    Where did this booking come from?
+                  </option>
+
+                  {BOOKING_CHANNELS.map((c) => (
+                    <option
+                      key={c}
+                      value={c}
+                      className="text-[#0F1923]"
+                    >
+                      {c}
+                    </option>
+                  ))}
+
+                  <option
+                    value={OTHER_CHANNEL}
+                    className="text-[#0F1923]"
+                  >
+                    Other (type it)
+                  </option>
+                </select>
+
+                {fieldErrors.booking_channel && (
+                  <div className="mt-1 text-[0.72rem] font-semibold text-[#C0392B]">
+                    {fieldErrors.booking_channel}
+                  </div>
+                )}
+              </div>
+
+              {form.booking_channel === OTHER_CHANNEL && (
+                <div>
+                  <label className="mb-1 block text-[0.65rem] font-bold uppercase tracking-[1px] text-[#868E96]">
+                    Source name *
+                  </label>
+
+                  <input
+                    value={form.booking_channel_other}
+                    maxLength={CHANNEL_MAX}
+                    autoFocus
+                    onChange={(e) =>
+                      update(
+                        "booking_channel_other",
+                        e.target.value,
+                      )
+                    }
+                    placeholder="e.g. Cleartrip, Instagram"
+                    className={`w-full rounded-md border px-3 py-2.5 text-sm outline-none ${
+                      fieldErrors.booking_channel_other
+                        ? "border-[#C0392B] focus:border-[#C0392B]"
+                        : "border-[#E9ECEF] focus:border-[#C9A84C]"
+                    }`}
+                  />
+
+                  {fieldErrors.booking_channel_other && (
+                    <div className="mt-1 text-[0.72rem] font-semibold text-[#C0392B]">
+                      {fieldErrors.booking_channel_other}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* CUSTOM ROOM RATE — every source except Walk-in. Either box
+                  can be typed; the other fills itself. Empty = room price. */}
+
+              {rateEditable && (
+                <div className="sm:col-span-2 rounded-lg border border-[#EADFB8] bg-[#FDFBF4] px-3 py-3">
+                  <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+                    <span className="text-[0.65rem] font-bold uppercase tracking-[1px] text-[#9A7A2A]">
+                      Room rate per night
+                    </span>
+                    <span className="text-[0.7rem] text-[#868E96]">
+                      Room price {money(roomNightlyRate)} — change it only if{" "}
+                      {bookingChannel || "the source"} sold it at a different price
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <div>
+                      <label className="mb-1 block text-[0.62rem] font-bold uppercase tracking-[0.8px] text-[#868E96]">
+                        Before GST (Rs.)
+                      </label>
+                      <input
+                        inputMode="decimal"
+                        value={form.custom_rate}
+                        placeholder={String(money2(roomNightlyRate))}
+                        onChange={(e) => setRate("base", e.target.value)}
+                        className={`w-full rounded-md border bg-white px-3 py-2.5 text-sm outline-none ${
+                          fieldErrors.custom_rate
+                            ? "border-[#C0392B]"
+                            : "border-[#E9ECEF] focus:border-[#C9A84C]"
+                        }`}
+                      />
+                    </div>
+
+                    <div>
+                      <label className="mb-1 block text-[0.62rem] font-bold uppercase tracking-[0.8px] text-[#868E96]">
+                        Incl. GST {formatRate(roomGstLabel)} (Rs.)
+                      </label>
+                      <input
+                        inputMode="decimal"
+                        value={form.custom_rate_incl}
+                        placeholder={String(
+                          money2(
+                            roomNightlyRate *
+                              (1 + roomPercentForTariff(room, roomNightlyRate) / 100),
+                          ),
+                        )}
+                        onChange={(e) => setRate("incl", e.target.value)}
+                        className={`w-full rounded-md border bg-white px-3 py-2.5 text-sm outline-none ${
+                          fieldErrors.custom_rate
+                            ? "border-[#C0392B]"
+                            : "border-[#E9ECEF] focus:border-[#C9A84C]"
+                        }`}
+                      />
+                    </div>
+                  </div>
+
+                  {fieldErrors.custom_rate && (
+                    <div className="mt-1 text-[0.72rem] font-semibold text-[#C0392B]">
+                      {fieldErrors.custom_rate}
+                    </div>
+                  )}
+
+                  {customRateToSend != null && (
+                    <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[0.72rem]">
+                      <span className="font-semibold text-[#9A7A2A]">
+                        Charging {money(customRateToSend)}/night instead of{" "}
+                        {money(roomNightlyRate)} — the bill below uses this rate
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setRate("base", "")}
+                        className="font-semibold text-[#868E96] underline-offset-2 hover:underline"
+                      >
+                        Use room price
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {[
                 [

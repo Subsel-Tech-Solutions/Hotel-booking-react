@@ -33,6 +33,7 @@ import {
   roomPercentFromRoom,
   splitGstRate,
 } from "./utils/billing";
+import { channelBadgeClass } from "./utils/bookingChannel";
 
 const API = process.env.REACT_APP_API_URL;
 function formatBookingId(booking) {
@@ -2916,7 +2917,8 @@ Number(booking.balance_paid || 0)
       !searchTerm ||
       b.guest_name?.toLowerCase().includes(searchTerm.toLowerCase()) ||
       b.room_type?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      b.email?.toLowerCase().includes(searchTerm.toLowerCase()),
+      b.email?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      b.booking_channel?.toLowerCase().includes(searchTerm.toLowerCase()),
   );
 
   const totalPages = Math.ceil(filteredBookings.length / itemsPerPage);
@@ -3689,6 +3691,18 @@ Number(booking.balance_paid || 0)
                               </span>
                             )}
                           </div>
+                          {/* where the guest booked from — older bookings
+                              without one show nothing here */}
+                          {b.booking_channel && (
+                            <span
+                              className={`mt-1 inline-block max-w-[160px] truncate rounded border px-1.5 py-[1px] text-[0.58rem] font-bold uppercase tracking-[0.5px] ${channelBadgeClass(
+                                b.booking_channel,
+                              )}`}
+                              title={`Booking source: ${b.booking_channel}`}
+                            >
+                              {b.booking_channel}
+                            </span>
+                          )}
                         </td>
 
                         <td className={tdCls}>

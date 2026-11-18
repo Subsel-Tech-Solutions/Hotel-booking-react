@@ -170,6 +170,23 @@ export function roomRateFromRoom(room = {}, guestCount = 1) {
   return roomPercentFromRoom(room, guestCount) / 100;
 }
 
+/*
+ * The GST percent for a room sold at a given nightly tariff — e.g. a custom
+ * Booking.com price. Mirrors roomRateForTariff() on the server: a configured
+ * rate wins, otherwise the slab follows the price actually charged. For the
+ * room's own price this equals roomPercentFromRoom().
+ */
+export function roomPercentForTariff(room = {}, nightlyTariff = 0) {
+  const c = room?.cgst_rate;
+  const s = room?.sgst_rate;
+  if (c != null && c !== "" && s != null && s !== "") {
+    return money2(Number(c) + Number(s));
+  }
+  const pct = room?.gst_rate;
+  if (pct != null && pct !== "") return Number(pct);
+  return slabRatePercent(nightlyTariff);
+}
+
 /**
  * The hotel's own GSTIN. Every invoice and PDF reads this constant so the
  * number can never differ between the admin copy, the guest download and the

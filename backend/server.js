@@ -401,7 +401,7 @@ function roomRatePercent(room, guestCount = 1) {
  * Pass the transaction's connection when the booking was inserted inside one,
  * otherwise the pool cannot see the uncommitted row.
  */
-async function stampRoomGstRate(bookingId, conn = db) {
+async function stampRoomGstRate(bookingId, conn = db, nightlyTariff = null) {
   try {
     /*
      * The rate is computed here in JS rather than with a SQL COALESCE,
@@ -426,7 +426,11 @@ async function stampRoomGstRate(bookingId, conn = db) {
     // Already stamped, or no such booking — either way there is nothing to do.
     if (rows.length) {
       const row = rows[0];
-      const total = roomRatePercent(row, row.guest_count);
+      // a custom room rate decides the slab by the price actually charged
+      const total =
+        nightlyTariff != null
+          ? roomRateForTariff(row, nightlyTariff)
+          : roomRatePercent(row, row.guest_count);
 
       /*
        * The split is frozen only when the room actually HAS one configured.
@@ -471,6 +475,109 @@ async function stampRoomGstRate(bookingId, conn = db) {
     console.error(`Could not open folio for booking ${bookingId}:`, e.message);
   }
 }
+
+/*
+ * BOOKING SOURCE — where the guest booked from (Walk-in, Agoda, MakeMyTrip…).
+ *
+ * Its own column, booking_channel. booking_source is deliberately NOT reused:
+ * it records which screen created the booking, and the bulk-booking delete
+ * depends on booking_source = 'BULK_BOOKING'.
+ *
+ * Saved by a separate, best-effort UPDATE after the booking exists, never
+ * inside the INSERT: a fresh deploy starts serving a few seconds before the
+ * migration adds the column, and a booking must never fail over a label.
+ * Purely informational — no amount, payment or status depends on it.
+ */
+const BOOKING_CHANNEL_MAX = 40;
+
+function cleanBookingChannel(value) {
+  if (value == null) return null;
+  const s = String(value)
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, BOOKING_CHANNEL_MAX);
+  return s || null;
+}
+
+async function setBookingChannel(bookingId, channel) {
+  const value = cleanBookingChannel(channel);
+  if (!value || !bookingId) return;
+  try {
+    await db.query("UPDATE bookings SET booking_channel=? WHERE booking_id=?", [
+      value,
+      bookingId,
+    ]);
+  } catch (e) {
+    console.error(`Could not save booking source for #${bookingId}:`, e.message);
+  }
+}
+
+/*
+ * CUSTOM ROOM RATE — staff may sell a stay at a price other than the room's
+ * own: Booking.com, Agoda, MakeMyTrip… sell above it, a phone booking may be
+ * negotiated. Allowed for every booking source EXCEPT Walk-in, where the desk
+ * price is the room price.
+ *
+ * Returns the nightly rate (before GST) to charge, or null to charge the
+ * room's own price — which is also what an older screen that never sends
+ * custom_nightly_rate gets, so nothing changes for it.
+ */
+const CUSTOM_RATE_MAX = 100000;
+
+function customNightlyRate(body = {}) {
+  const raw = body?.custom_nightly_rate;
+  if (raw === undefined || raw === null || raw === "") return null;
+
+  const fail = (message) => {
+    const err = new Error(message);
+    err.status = 400;
+    throw err;
+  };
+
+  const channel = cleanBookingChannel(body.booking_channel);
+  if (!channel) fail("Select the booking source before changing the room rate");
+  if (channel.toLowerCase() === "walk-in") {
+    fail("Walk-in bookings are charged at the room's own price");
+  }
+
+  const rate = Number(raw);
+  if (!Number.isFinite(rate) || rate <= 0 || rate > CUSTOM_RATE_MAX) {
+    fail("Enter a valid room rate per night");
+  }
+  return round2(rate);
+}
+
+/*
+ * ADD-ON ALREADY COLLECTED?
+ *
+ * "Mark as Paid" on the balance settles the WHOLE bill — add-on lines
+ * included — but leaves those lines at paid=0. The delete guard looked only at
+ * paid=1, so such a charge could still be removed, and the bill then dropped
+ * below the money already taken (Rs.4,500 bill, Rs.5,010 paid).
+ *
+ * The rule is simply "never let the bill fall below what has been paid":
+ * if removing this line would leave the booking owing less than nothing, the
+ * line's money has (at least partly) been collected, so it stays.
+ */
+async function addonMoneyCollected(bookingId, addon) {
+  const [[bk]] = await db.query("SELECT * FROM bookings WHERE booking_id=?", [
+    bookingId,
+  ]);
+  if (!bk) return false;
+  const lineTaxable = round2(addon.taxable_amount ?? addon.amount);
+  const rate =
+    addon.gst_rate != null ? Number(addon.gst_rate) : LEGACY_ADDON_GST_PERCENT;
+  const lineGst =
+    addon.gst_amount != null
+      ? round2(addon.gst_amount)
+      : round2((lineTaxable * rate) / 100);
+  const { remaining } = outstandingBalance(bk);
+  return round2(Number(remaining) - (lineTaxable + lineGst)) < -0.01;
+}
+
+const ADDON_COLLECTED_ERROR =
+  "This charge has already been paid with the balance, so it can't be removed. Give a checkout discount instead if the guest shouldn't pay for it.";
 
 // ─── AUTO MIGRATE ────────────────────────────────────────────────────────────
 async function runMigrations() {
@@ -569,6 +676,8 @@ async function runMigrations() {
       // Billing address printed under BILL TO. Optional — a booking without one
       // prints exactly as it did before.
       "customer_address VARCHAR(255) DEFAULT NULL",
+      // Where the guest booked from — see setBookingChannel()
+      "booking_channel VARCHAR(40) DEFAULT NULL",
     ];
     for (const col of cols) {
       try {
@@ -579,6 +688,32 @@ async function runMigrations() {
         if (e.code !== "ER_DUP_FIELDNAME") {
           console.error(`Migration failed for column [${col}]:`, e.message);
         }
+      }
+    }
+
+    // Booking source for bookings made before the field existed — only what
+    // the stored data proves: the website (guest checkout, or a signed-in
+    // guest who paid online) and bulk bookings. Bookings the desk made stay
+    // blank ("Not recorded") rather than guessed. Touches only blank rows,
+    // so running it on every start is harmless.
+    for (const [label, sql] of [
+      [
+        "Website",
+        `booking_source = 'GUEST_CHECKOUT'
+           OR (booking_source IS NULL
+               AND advance_order_id IS NOT NULL
+               AND advance_payment_mode = 'Online')`,
+      ],
+      ["Bulk Booking", "booking_source = 'BULK_BOOKING'"],
+    ]) {
+      try {
+        await db.query(
+          `UPDATE bookings SET booking_channel = ?
+            WHERE booking_channel IS NULL AND (${sql})`,
+          [label],
+        );
+      } catch (e) {
+        console.error(`Booking source backfill (${label}) failed:`, e.message);
       }
     }
 
@@ -2774,6 +2909,10 @@ async function calculateBookingAmounts({
   // ADDITIONAL: admin bookings may be issued without GST. Defaults to true,
   // so guest checkout and every existing caller behave exactly as before.
   gst_enabled = true,
+  // CUSTOM ROOM RATE — a nightly rate (before GST) the desk sold this stay
+  // at, e.g. a Booking.com price. null = the room's own price, as always.
+  // Only staff routes pass it, and only via customNightlyRate().
+  nightly_rate_override = null,
 }) {
   const [roomRows] = await db.query("SELECT * FROM rooms WHERE room_id=?", [
     room_id,
@@ -2835,7 +2974,10 @@ async function calculateBookingAmounts({
     throw err;
   }
 
-  const nightlyRate = resolveNightlyRate(room, guest_count);
+  const nightlyRate =
+    nightly_rate_override != null
+      ? nightly_rate_override
+      : resolveNightlyRate(room, guest_count);
   const roomSubtotal = nightlyRate * nights;
   const requestedDiscount = Number(discount_amount || 0);
   const discountAmount = discount_applied ? requestedDiscount : 0;
@@ -2867,7 +3009,7 @@ async function calculateBookingAmounts({
    *
    * The caller writes this onto the booking as room_gst_rate, freezing it.
    */
-  const roomGstRate = roomRatePercent(room, guest_count);
+  const roomGstRate = roomRateForTariff(room, nightlyRate);
   const gstAmount =
     Math.round(taxableAmount * (roomGstRate / 100) * 100) / 100;
 
@@ -4077,6 +4219,8 @@ app.post(
       const bookingId = result.insertId;
       // freeze the room's GST rate onto this booking
       await stampRoomGstRate(bookingId);
+      // where the guest booked from (label only)
+      await setBookingChannel(bookingId, "Website");
 
       const order = await razorpay.orders.create({
         amount: Math.round(amounts.totalAmount * 100),
@@ -4276,6 +4420,8 @@ app.post("/api/payment/create-order", requireAuth, async (req, res) => {
     const booking_id = result.insertId;
     // freeze the room's GST rate onto this booking
     await stampRoomGstRate(booking_id);
+    // where the guest booked from (label only)
+    await setBookingChannel(booking_id, "Website");
     const razorpayOrder = await razorpay.orders.create({
       amount: Math.round(total_price * 100),
       currency: "INR",
@@ -5596,6 +5742,8 @@ app.post(
         gst_enabled,
         // staff route — walk-ins and late paperwork need past check-in dates
         allowPastDates: true,
+        // custom room rate (any source except Walk-in) — null = room price
+        nightly_rate_override: customNightlyRate(req.body),
       });
       const requestedGuests = Math.max(1, Number(req.body.guest_count) || 1);
       if (requestedGuests > Number(amounts.room.capacity || requestedGuests)) {
@@ -5748,6 +5896,8 @@ app.post(
         discount_amount,
         gst_enabled: gst_enabled !== false,
         allowPastDates: true,
+        // custom room rate (any source except Walk-in) — null = room price
+        nightly_rate_override: customNightlyRate(req.body),
       });
 
       // ------------------------------------------------------------
@@ -6004,7 +6154,18 @@ app.post(
       const bookingId = result.insertId;
       // freeze the room's GST rate onto this booking, before the invoice is
       // built from it
-      await stampRoomGstRate(bookingId);
+      await stampRoomGstRate(bookingId, db, customNightlyRate(req.body));
+      // where the guest booked from (label only)
+      await setBookingChannel(bookingId, req.body?.booking_channel);
+      // a custom room rate is recorded on the booking's history
+      if (customNightlyRate(req.body) != null) {
+        await logBookingEvent(
+          req,
+          bookingId,
+          "custom_rate",
+          `Room rate Rs.${customNightlyRate(req.body)}/night (room price Rs.${resolveNightlyRate(amounts.room, guest_count)}) · ${cleanBookingChannel(req.body.booking_channel)}`,
+        );
+      }
 
       loadBookingForInvoice(bookingId)
         .then((booking) => {
@@ -6219,6 +6380,8 @@ app.post(
           // Admin / Manager can create
           // booking with past dates
           allowPastDates: true,
+          // custom room rate (any source except Walk-in) — null = room price
+          nightly_rate_override: customNightlyRate(req.body),
         });
 
       // ============================================================
@@ -6514,7 +6677,18 @@ app.post(
 
       // freeze the room's GST rate onto this booking, before the invoice is
       // built from it
-      await stampRoomGstRate(bookingId);
+      await stampRoomGstRate(bookingId, db, customNightlyRate(req.body));
+      // where the guest booked from (label only)
+      await setBookingChannel(bookingId, req.body?.booking_channel);
+      // a custom room rate is recorded on the booking's history
+      if (customNightlyRate(req.body) != null) {
+        await logBookingEvent(
+          req,
+          bookingId,
+          "custom_rate",
+          `Room rate Rs.${customNightlyRate(req.body)}/night (room price Rs.${resolveNightlyRate(amounts.room, guest_count)}) · ${cleanBookingChannel(req.body.booking_channel)}`,
+        );
+      }
 
       // ============================================================
       // 16. SEND INVOICE EMAIL
@@ -7207,6 +7381,320 @@ app.post(
       });
     } catch (err) {
       next(err);
+    }
+  },
+);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   EXTEND STAY
+   ═══════════════════════════════════════════════════════════════════════════
+   A guest who stays longer is billed for every night they stay.
+
+   THE RULE: an extended bill is exactly the bill the booking would have had
+   if those nights were booked in the first place — same nightly rate, same
+   frozen GST rate, same discounts, same add-ons. Nothing here computes tax
+   or a balance on its own: the extra nights are added to the room tariff
+   (total_price, and taxable_amount when stored — the same pair every booking
+   path writes) and recalcBookingTotals() does the rest, as for any booking.
+
+   LATE CHECK-OUT (hotel's 24-hour policy): a stay is due out at the actual
+   check-in time + nights x 24 hours. Every FULL 24 hours past that is one
+   more night. Less than 24 hours over is not charged automatically — the
+   desk can post a "Late checkout" add-on if the hotel wants to.
+   ═══════════════════════════════════════════════════════════════════════ */
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_EXTEND_NIGHTS = 60;
+
+// the nightly room rate this stay was SOLD at — not today's room price
+function bookedNightlyRate(booking) {
+  const nights = Math.max(
+    1,
+    nightsBetween(booking.check_in_date, booking.check_out_date).length,
+  );
+  // the vehicle comes off first, exactly as the invoice folio splits it
+  const grossRoom = Math.max(
+    0,
+    round2(Number(booking.total_price || 0) - round2(booking.vehicle_price)),
+  );
+  return { nights, rate: round2(grossRoom / nights) };
+}
+
+function nightsBetweenKeys(fromKey, toKey) {
+  const [y1, m1, d1] = fromKey.split("-").map(Number);
+  const [y2, m2, d2] = toKey.split("-").map(Number);
+  return Math.round(
+    (Date.UTC(y2, m2 - 1, d2) - Date.UTC(y1, m1 - 1, d1)) / DAY_MS,
+  );
+}
+
+// full 24-hour blocks the guest has stayed past the due-out time
+function stayOverrun(booking, now = new Date()) {
+  const checkin = booking.actual_checkin ? new Date(booking.actual_checkin) : null;
+  if (!checkin || Number.isNaN(checkin.getTime())) {
+    return { measurable: false, extraNights: 0 };
+  }
+  const { nights } = bookedNightlyRate(booking);
+  const dueOut = new Date(checkin.getTime() + nights * DAY_MS);
+  const overMs = Math.max(0, now.getTime() - dueOut.getTime());
+  return {
+    measurable: true,
+    nights,
+    dueOut,
+    overHours: Math.floor((overMs / 3600000) * 10) / 10,
+    extraNights: Math.floor(overMs / DAY_MS),
+  };
+}
+
+/*
+ * Work out an extension without writing anything: validates the dates,
+ * checks the room is free for the extra nights, and returns the new bill
+ * using the same arithmetic as recalcBookingTotals().
+ */
+async function planExtension(booking, newOutRaw) {
+  const fail = (status, error, extra = {}) => {
+    const err = new Error(error);
+    err.status = status;
+    Object.assign(err, extra);
+    throw err;
+  };
+
+  if (String(booking.status || "").toLowerCase() !== "confirmed") {
+    fail(400, "Only an active stay can be extended");
+  }
+
+  const oldOut = istDateKey(booking.check_out_date);
+  const newOut =
+    typeof newOutRaw === "string" && /^\d{4}-\d{2}-\d{2}$/.test(newOutRaw)
+      ? newOutRaw
+      : null;
+  if (!oldOut || !newOut) fail(400, "Select a valid new check-out date");
+
+  const addedNights = nightsBetweenKeys(oldOut, newOut);
+  if (addedNights <= 0) {
+    fail(400, "The new check-out date must be after the current one");
+  }
+  if (addedNights > MAX_EXTEND_NIGHTS) {
+    fail(400, `A stay can be extended by at most ${MAX_EXTEND_NIGHTS} nights at a time`);
+  }
+
+  // the room must be free for every extra night
+  const [[clash]] = await db.query(
+    `SELECT b.booking_id, b.check_in_date, u.name AS guest_name
+       FROM bookings b
+       LEFT JOIN users u ON u.user_id = b.user_id
+      WHERE b.room_id = ?
+        AND b.booking_id <> ?
+        AND b.status NOT IN ('cancelled','pending')
+        AND b.check_in_date < ?
+        AND b.check_out_date > ?
+      ORDER BY b.check_in_date
+      LIMIT 1`,
+    [booking.room_id, booking.booking_id, newOut, oldOut],
+  );
+  if (clash) {
+    const nextIn = istDateKey(clash.check_in_date);
+    fail(
+      409,
+      `This room is booked from ${nextIn}${clash.guest_name ? ` (${clash.guest_name}, booking #${clash.booking_id})` : ` (booking #${clash.booking_id})`}. The stay can be extended up to ${nextIn} at most.`,
+      { code: "ROOM_TAKEN", latest_check_out: nextIn > oldOut ? nextIn : null },
+    );
+  }
+  const [[held]] = await db.query(
+    `SELECT blocked_date, block_reason
+       FROM room_blocked_dates
+      WHERE room_id = ?
+        AND blocked_date >= ? AND blocked_date < ?
+        AND (booking_id IS NULL OR booking_id <> ?)
+      ORDER BY blocked_date
+      LIMIT 1`,
+    [booking.room_id, oldOut, newOut, booking.booking_id],
+  );
+  if (held) {
+    const heldOn = istDateKey(held.blocked_date);
+    fail(
+      409,
+      `This room is blocked on ${heldOn}${held.block_reason ? ` (${held.block_reason})` : ""}. The stay can be extended up to ${heldOn} at most.`,
+      { code: "ROOM_BLOCKED", latest_check_out: heldOn > oldOut ? heldOn : null },
+    );
+  }
+
+  const { nights, rate } = bookedNightlyRate(booking);
+  const addedTariff = round2(rate * addedNights);
+
+  // same arithmetic as recalcBookingTotals(), for the bill as it is now
+  // and for the bill with the extra nights
+  const addons = await getAddonTotals(booking.booking_id);
+  const billWith = (extra) => {
+    const roomTaxable = round2(roomTaxableValue(booking) + extra);
+    const roomGst = round2(roomTaxable * roomGstFractionOf(booking));
+    const subtotal = round2(roomTaxable + addons.taxable);
+    const gst = isGstDisabled(booking) ? 0 : round2(roomGst + addons.gst);
+    return round2(subtotal + gst);
+  };
+  const currentTotal = billWith(0);
+  const newTotal = billWith(addedTariff);
+  const paid = round2(
+    Number(booking.advance_paid || 0) + Number(booking.balance_paid || 0),
+  );
+
+  return {
+    booking_id: booking.booking_id,
+    current_check_out_date: oldOut,
+    new_check_out_date: newOut,
+    current_nights: nights,
+    added_nights: addedNights,
+    new_nights: nights + addedNights,
+    nightly_rate: rate,
+    added_tariff: addedTariff,
+    current_total: currentTotal,
+    new_total: newTotal,
+    extra_amount: round2(newTotal - currentTotal),
+    paid,
+    new_balance: Math.max(0, round2(newTotal - paid)),
+  };
+}
+
+async function loadBookingForStay(id) {
+  const [[booking]] = await db.query("SELECT * FROM bookings WHERE booking_id=?", [id]);
+  if (!booking) {
+    const err = new Error("Booking not found");
+    err.status = 404;
+    throw err;
+  }
+  return booking;
+}
+
+const stayError = (res, err) =>
+  res.status(err.status || 500).json({
+    error: err.message,
+    ...(err.code ? { code: err.code } : {}),
+    ...(err.latest_check_out !== undefined ? { latest_check_out: err.latest_check_out } : {}),
+  });
+
+// preview — nothing is written
+app.get("/api/bookings/:id/extend-stay", requireManager, async (req, res) => {
+  try {
+    const booking = await loadBookingForStay(req.params.id);
+    res.json(await planExtension(booking, req.query.new_check_out_date));
+  } catch (err) {
+    stayError(res, err);
+  }
+});
+
+app.post("/api/bookings/:id/extend-stay", requireManager, async (req, res) => {
+  try {
+    const booking = await loadBookingForStay(req.params.id);
+    const plan = await planExtension(booking, req.body?.new_check_out_date);
+
+    // guarded on the old check-out date, so a double click or two people
+    // extending at once cannot add the nights twice
+    const [upd] = await db.query(
+      `UPDATE bookings
+          SET check_out_date = ?,
+              total_price    = ROUND(total_price + ?, 2),
+              taxable_amount = CASE WHEN taxable_amount IS NULL THEN NULL
+                                    ELSE ROUND(taxable_amount + ?, 2) END
+        WHERE booking_id = ?
+          AND status = 'confirmed'
+          AND check_out_date = ?`,
+      [
+        plan.new_check_out_date,
+        plan.added_tariff,
+        plan.added_tariff,
+        booking.booking_id,
+        plan.current_check_out_date,
+      ],
+    );
+    if (!upd.affectedRows) {
+      return res.status(409).json({
+        error: "This booking was just changed. Refresh and try again.",
+      });
+    }
+
+    // GST, add-ons, discounts, balance, payment status and the invoice's
+    // night-wise lines — all through the one function every booking uses
+    const totals = await recalcBookingTotals(booking.booking_id);
+
+    await logBookingEvent(
+      req,
+      booking.booking_id,
+      "extend_stay",
+      `${plan.current_check_out_date} → ${plan.new_check_out_date} · +${plan.added_nights} night${plan.added_nights === 1 ? "" : "s"} · Rs.${plan.extra_amount}${req.body?.reason === "overstay" ? " · late check-out" : ""}`,
+    );
+
+    res.json({
+      ...plan,
+      total_amount: totals?.totalAmount,
+      remaining_amount: totals?.remainingAmount,
+    });
+  } catch (err) {
+    stayError(res, err);
+  }
+});
+
+// late check-out: full 24-hour blocks past the due-out time, if any
+app.get("/api/bookings/:id/overstay", requireManager, async (req, res) => {
+  try {
+    const booking = await loadBookingForStay(req.params.id);
+    const overrun = stayOverrun(booking);
+    const result = {
+      booking_id: booking.booking_id,
+      measurable: overrun.measurable,
+      due_out: overrun.dueOut || null,
+      over_hours: overrun.overHours || 0,
+      extra_nights: overrun.extraNights,
+      plan: null,
+    };
+    if (overrun.extraNights > 0 && String(booking.status).toLowerCase() === "confirmed") {
+      const newOut = addDaysKey(istDateKey(booking.check_out_date), overrun.extraNights);
+      try {
+        result.plan = await planExtension(booking, newOut);
+      } catch (err) {
+        // e.g. the room is booked for those nights — say so, still report it
+        result.plan_error = err.message;
+        result.suggested_check_out_date = newOut;
+      }
+    }
+    res.json(result);
+  } catch (err) {
+    stayError(res, err);
+  }
+});
+
+/*
+ * BOOKING SOURCE — correct where a booking came from (the desk picked the
+ * wrong one, or an older booking shows "Not recorded"). A label only: no
+ * amount, payment or status is touched. Every change is logged.
+ */
+app.patch(
+  "/api/bookings/:id/booking-channel",
+  requireManager,
+  async (req, res) => {
+    try {
+      const value = cleanBookingChannel(req.body?.booking_channel);
+      if (!value)
+        return res.status(400).json({ error: "Select a booking source" });
+
+      const [[booking]] = await db.query(
+        "SELECT booking_id, booking_channel FROM bookings WHERE booking_id=?",
+        [req.params.id],
+      );
+      if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+      await db.query(
+        "UPDATE bookings SET booking_channel=? WHERE booking_id=?",
+        [value, req.params.id],
+      );
+      await logBookingEvent(
+        req,
+        req.params.id,
+        "booking_channel",
+        `${booking.booking_channel || "Not recorded"} → ${value}`,
+      );
+
+      res.json({ booking_id: Number(req.params.id), booking_channel: value });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
     }
   },
 );
@@ -8370,12 +8858,14 @@ app.delete(
   async (req, res) => {
     try {
       const [[addon]] = await db.query(
-        "SELECT paid FROM booking_addons WHERE addon_id=? AND booking_id=?",
+        "SELECT * FROM booking_addons WHERE addon_id=? AND booking_id=?",
         [req.params.addon_id, req.params.id],
       );
       if (!addon) return res.status(404).json({ error: "Add-on not found" });
-      if (addon.paid === 1)
+      if (Number(addon.paid) === 1)
         return res.status(400).json({ error: "Cannot remove a paid add-on" });
+      if (await addonMoneyCollected(req.params.id, addon))
+        return res.status(400).json({ error: ADDON_COLLECTED_ERROR });
       // void on the folio BEFORE the row goes, while the link still exists
       await voidAddonFolioLine(req.params.id, req.params.addon_id, "Charge removed by admin");
       await db.query(
@@ -8403,10 +8893,14 @@ app.delete(
   },
 );
 
-app.patch(
-  "/api/bookings/:id/addons/mark-paid",
-  requireAdmin,
-  async (req, res) => {
+/*
+ * MARK ADD-ONS PAID — one handler, registered for the admin AND the manager.
+ * The manager dashboard has always called /api/manager/bookings/:id/addons/
+ * mark-paid, but no such route existed, so the button 404'd. Sharing the
+ * admin handler means both screens settle add-ons with exactly the same
+ * money rules (capped at what is still owed, folio line, recalc).
+ */
+async function markAddonsPaidHandler(req, res) {
     try {
       // the WHOLE row, not just the status — outstandingBalance() below needs
       // the payment and discount columns to work out what is genuinely owed
@@ -8496,6 +8990,13 @@ app.patch(
         // recalc rewrites remaining_amount from the new balance_paid, so the
         // stored figure and the screen finally agree
         await recalcBookingTotals(req.params.id);
+
+        await logBookingEvent(
+          req,
+          req.params.id,
+          "addons_paid",
+          `Rs.${settledNow} · ${mode}`,
+        );
       }
 
       const [addons] = await db.query(
@@ -8515,7 +9016,18 @@ app.patch(
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
-  },
+}
+
+app.patch(
+  "/api/bookings/:id/addons/mark-paid",
+  requireAdmin,
+  markAddonsPaidHandler,
+);
+
+app.patch(
+  "/api/manager/bookings/:id/addons/mark-paid",
+  requireManager,
+  markAddonsPaidHandler,
 );
 // ══════════════════════════════════════════════════════════════════════════════
 //  ADMIN
@@ -9450,6 +9962,8 @@ app.post(
         bookingId = result.insertId;
         // freeze the room's GST rate onto this bulk booking
         await stampRoomGstRate(bookingId);
+        // where the guest booked from (label only)
+        await setBookingChannel(bookingId, "Bulk Booking");
         await logBookingEvent(req, bookingId, "bulk_create", note);
       }
 
@@ -9929,12 +10443,14 @@ app.delete(
        * leave the booking's total short of the money already collected.
        */
       const [[addon]] = await db.query(
-        "SELECT paid FROM booking_addons WHERE addon_id=? AND booking_id=?",
+        "SELECT * FROM booking_addons WHERE addon_id=? AND booking_id=?",
         [req.params.addon_id, req.params.id],
       );
       if (!addon) return res.status(404).json({ error: "Add-on not found" });
       if (Number(addon.paid) === 1)
         return res.status(400).json({ error: "Cannot remove a paid add-on" });
+      if (await addonMoneyCollected(req.params.id, addon))
+        return res.status(400).json({ error: ADDON_COLLECTED_ERROR });
       const [[bk]] = await db.query(
         "SELECT actual_checkout FROM bookings WHERE booking_id=?",
         [req.params.id],

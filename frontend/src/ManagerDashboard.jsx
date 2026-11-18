@@ -37,6 +37,14 @@ import {
   roomRateFromRoom,
   roomPercentFromRoom,
 } from "./utils/billing";
+import { formatStayTime } from "./utils/stayTime";
+import {
+  channelOf,
+  channelBadgeClass,
+  summariseBySource,
+  NOT_RECORDED,
+} from "./utils/bookingChannel";
+import ExtendStayModal from "./Components/ExtendStayModal";
 
 
 const API = process.env.REACT_APP_API_URL || "";
@@ -492,6 +500,49 @@ function BookingDetailModal({ bookingId, onClose, showToast, onRefresh }) {
     fetchBooking();
   }, [bookingId]); // eslint-disable-line
 
+  /* EXTEND STAY / LATE CHECK-OUT — same rules as the admin page:
+   * each FULL 24 hours past the due-out time is one more night, shown as a
+   * banner so the nights are added before the balance is collected */
+  const [extendMode, setExtendMode] = useState(null);
+  const [overstayInfo, setOverstayInfo] = useState(null);
+
+  // null when there is nothing to add, or the server is an older version
+  async function fetchOverstay() {
+    try {
+      const res = await apiFetch(`/api/bookings/${bookingId}/overstay`);
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data && data.extra_nights > 0 ? data : null;
+    } catch {
+      return null;
+    }
+  }
+
+  useEffect(() => {
+    const active =
+      booking?.actual_checkin &&
+      !booking?.actual_checkout &&
+      String(booking?.status || "").toLowerCase() === "confirmed";
+    if (!active) {
+      setOverstayInfo(null);
+      return undefined;
+    }
+    let cancelled = false;
+    fetchOverstay().then((data) => {
+      if (!cancelled) setOverstayInfo(data);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [bookingId, booking?.actual_checkin, booking?.actual_checkout, booking?.check_out_date, booking?.status]); // eslint-disable-line
+
+  function afterExtend() {
+    setExtendMode(null);
+    setOverstayInfo(null);
+    fetchBooking();
+    onRefresh && onRefresh();
+  }
+
   async function handleCheckin() {
     let res = await apiFetch(`/api/manager/bookings/${bookingId}/checkin`, {
       method: "PATCH",
@@ -514,6 +565,15 @@ function BookingDetailModal({ bookingId, onClose, showToast, onRefresh }) {
   }
 
   async function handleCheckout() {
+    // LATE CHECK-OUT — every full 24 hours past the due-out time is billed
+    // before the stay can close
+    const late = await fetchOverstay();
+    if (late) {
+      setOverstayInfo(late);
+      setExtendMode({ mode: "overstay", overstay: late });
+      return;
+    }
+
     if (
       !(await confirmDialog("Confirm checkout? This will calculate final bill.", {
         confirmText: "Check out",
@@ -1323,6 +1383,19 @@ const bookingPaidLabel =
               {booking.room_type} · {booking.check_in_date?.slice(0, 10)} →{" "}
               {booking.check_out_date?.slice(0, 10)}
             </div>
+            {/* where the guest booked from */}
+            <div className="text-xs text-white/45 mt-0.5">
+              Source:{" "}
+              <span
+                className={
+                  channelOf(booking) === NOT_RECORDED
+                    ? "text-white/45"
+                    : "font-semibold text-[#C9A84C]"
+                }
+              >
+                {channelOf(booking)}
+              </span>
+            </div>
           </div>
           <button
             onClick={onClose}
@@ -1372,6 +1445,27 @@ const bookingPaidLabel =
                   </div>
                 </div>
               ) : (
+                <div className="space-y-2">
+                {overstayInfo && (
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[0.72rem] leading-relaxed text-amber-900">
+                    <b>Late check-out:</b> {overstayInfo.over_hours} hr past
+                    due-out — {overstayInfo.extra_nights} extra night
+                    {overstayInfo.extra_nights === 1 ? "" : "s"}
+                    {overstayInfo.plan
+                      ? ` (Rs.${Number(overstayInfo.plan.extra_amount).toLocaleString("en-IN")})`
+                      : ""}
+                    .{" "}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setExtendMode({ mode: "overstay", overstay: overstayInfo })
+                      }
+                      className="font-bold underline"
+                    >
+                      Add to bill
+                    </button>
+                  </div>
+                )}
                 <button
                   onClick={handleCheckout}
                   disabled={
@@ -1386,6 +1480,28 @@ const bookingPaidLabel =
                 >
                   ⏹ Record Check-out
                 </button>
+                {String(booking.status || "").toLowerCase() === "confirmed" && (
+                  <button
+                    type="button"
+                    onClick={() => setExtendMode({ mode: "planned" })}
+                    className="block text-[0.75rem] font-semibold text-navy hover:underline"
+                  >
+                    ＋ Extend Stay
+                  </button>
+                )}
+                </div>
+              )}
+              {extendMode && (
+                <ExtendStayModal
+                  bookingId={bookingId}
+                  currentCheckOut={booking.check_out_date}
+                  mode={extendMode.mode}
+                  overstay={extendMode.overstay}
+                  apiFetch={apiFetch}
+                  toast={showToast}
+                  onClose={() => setExtendMode(null)}
+                  onDone={afterExtend}
+                />
               )}
             </div>
           </div>
@@ -2352,6 +2468,28 @@ function ReportsTab({ showToast }) {
     );
 
     // ===================================================
+    // BY BOOKING SOURCE — bookings and revenue per source; adds up to the
+    // Total Revenue box. The first-page table starts just below it.
+    // ===================================================
+    const sourceText = summariseBySource(reportData.bookings)
+      .map(
+        (r) =>
+          `${r.label}: ${r.count} (Rs.${Number(r.revenue).toLocaleString()})`
+      )
+      .join("    ");
+
+    const sourceLines = sourceText
+      ? doc.splitTextToSize(`By booking source —   ${sourceText}`, tableWidth)
+      : [];
+
+    sourceLines.forEach((line, i) => {
+      doc.text(line, marginX, infoY + 14 + i * 5);
+    });
+
+    const firstTableY =
+      infoY + 18 + (sourceLines.length ? sourceLines.length * 5 + 2 : 0);
+
+    // ===================================================
     // PDF TABLE COLUMN CONFIGURATION
     // ===================================================
     const columns = [
@@ -2519,7 +2657,7 @@ function ReportsTab({ showToast }) {
     drawPdfHeader();
 
     let tableY = drawTableHeader(
-      infoY + 18
+      firstTableY
     );
 
     // ===================================================
@@ -2582,6 +2720,9 @@ function ReportsTab({ showToast }) {
             "…";
         }
 
+        // where the guest booked from, printed under the name
+        const sourceLabel = channelOf(b);
+
         let roomType =
           b.room_type || "—";
 
@@ -2606,6 +2747,17 @@ function ReportsTab({ showToast }) {
                 10
               )
             : "—";
+
+        // actual arrival / departure time, printed under the date
+        const checkInTime = formatStayTime(
+          b.actual_checkin,
+          b.check_in_date
+        );
+
+        const checkOutTime = formatStayTime(
+          b.actual_checkout,
+          b.check_out_date
+        );
 
         const baseAmount =
           Number(
@@ -2666,6 +2818,8 @@ function ReportsTab({ showToast }) {
         columns.forEach(
           (column) => {
             let value = "";
+            // second, smaller line under the value — the check-in/out time
+            let subValue = "";
             let align =
               column.align;
 
@@ -2678,6 +2832,7 @@ function ReportsTab({ showToast }) {
 
               case "guest":
                 value = guestName;
+                subValue = sourceLabel;
                 break;
 
               case "room":
@@ -2686,10 +2841,12 @@ function ReportsTab({ showToast }) {
 
               case "checkIn":
                 value = checkIn;
+                subValue = checkInTime;
                 break;
 
               case "checkOut":
                 value = checkOut;
+                subValue = checkOutTime;
                 break;
 
               case "base":
@@ -2781,20 +2938,33 @@ function ReportsTab({ showToast }) {
                 column.width / 2;
             }
 
-            doc.text(
-              value,
-              textX,
-              tableY,
-              {
-                align:
-                  align === "right"
-                    ? "right"
-                    : align ===
-                        "center"
-                      ? "center"
-                      : "left",
-              }
-            );
+            const textAlign =
+              align === "right"
+                ? "right"
+                : align === "center"
+                  ? "center"
+                  : "left";
+
+            if (subValue) {
+              // date on top, time underneath in smaller grey — both inside
+              // the same 10mm row, so row height and page breaks are unchanged
+              doc.text(value, textX, tableY - 1.8, {
+                align: textAlign,
+              });
+
+              doc.setFontSize(6);
+              doc.setFont("helvetica", "normal");
+              doc.setTextColor(...textGray);
+              doc.text(subValue, textX, tableY + 1.6, {
+                align: textAlign,
+              });
+
+              doc.setFontSize(7);
+            } else {
+              doc.text(value, textX, tableY, {
+                align: textAlign,
+              });
+            }
 
             x += column.width;
           }
@@ -3078,6 +3248,41 @@ function ReportsTab({ showToast }) {
             )}
           </div>
 
+          {/* BY BOOKING SOURCE — adds up to the Total Revenue card */}
+          {reportData.bookings?.length > 0 && (
+            <div className="mb-5 rounded-xl border border-[#E9ECEF] bg-white px-[18px] py-4">
+              <div className="mb-3 text-[0.62rem] font-bold uppercase tracking-[1px] text-[#868E96]">
+                By booking source
+              </div>
+
+              <div className="flex flex-wrap gap-2.5">
+                {summariseBySource(reportData.bookings).map((r) => (
+                  <div
+                    key={r.label}
+                    className="min-w-[150px] rounded-lg border border-[#F1F3F5] bg-[#FAFBFC] px-3 py-2"
+                  >
+                    <span
+                      className={`inline-block rounded border px-1.5 py-[1px] text-[0.6rem] font-bold uppercase tracking-[0.5px] ${channelBadgeClass(
+                        r.label
+                      )}`}
+                    >
+                      {r.label}
+                    </span>
+
+                    <div className="mt-1.5 flex items-baseline justify-between gap-3">
+                      <span className="text-[0.75rem] text-[#868E96]">
+                        {r.count} booking{r.count === 1 ? "" : "s"}
+                      </span>
+                      <span className="text-[0.9rem] font-semibold text-[#0F1923]">
+                        Rs.{Number(r.revenue).toLocaleString()}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* PDF DOWNLOAD */}
           <div className="mb-5">
             <button
@@ -3174,6 +3379,13 @@ function ReportsTab({ showToast }) {
 
                           <td className="px-3 py-2.5 text-center text-[0.82rem] font-semibold text-[#0F1923] whitespace-nowrap">
                             {b.guest_name}
+                            <span
+                              className={`mx-auto mt-1 block w-fit rounded border px-1.5 py-[1px] text-[0.58rem] font-bold uppercase tracking-[0.5px] ${channelBadgeClass(
+                                channelOf(b)
+                              )}`}
+                            >
+                              {channelOf(b)}
+                            </span>
                           </td>
 
                           <td className="px-3 py-2.5 text-center text-[0.78rem] text-[#495057]">
@@ -3185,12 +3397,28 @@ function ReportsTab({ showToast }) {
                               0,
                               10
                             )}
+                            {b.actual_checkin && (
+                              <span className="block text-[0.68rem] text-[#868E96]">
+                                {formatStayTime(
+                                  b.actual_checkin,
+                                  b.check_in_date
+                                )}
+                              </span>
+                            )}
                           </td>
 
                           <td className="px-3 py-2.5 text-center text-[0.78rem] text-[#495057] whitespace-nowrap">
                             {b.check_out_date?.slice(
                               0,
                               10
+                            )}
+                            {b.actual_checkout && (
+                              <span className="block text-[0.68rem] text-[#868E96]">
+                                {formatStayTime(
+                                  b.actual_checkout,
+                                  b.check_out_date
+                                )}
+                              </span>
                             )}
                           </td>
 
@@ -3422,7 +3650,8 @@ export default function ManagerDashboard({ managerUser, onLogout }) {
       !searchTerm ||
       b.guest_name?.toLowerCase().includes(searchTerm.toLowerCase()) ||
       b.room_type?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      b.email?.toLowerCase().includes(searchTerm.toLowerCase())
+      b.email?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      b.booking_channel?.toLowerCase().includes(searchTerm.toLowerCase())
   );
 const totalPages = Math.ceil(
   filteredBookings.length / itemsPerPage
@@ -3912,7 +4141,20 @@ const paginatedBookings = filteredBookings.slice(
                       paginatedBookings.map((b) => (
                         <tr key={b.booking_id} className="border-t border-[#F1F3F5]">
                           <td className="px-3 py-3 text-[0.82rem] text-[#868E96]">#{b.booking_id}</td>
-                          <td className="px-3 py-3 font-semibold text-[#0F1923]">{b.guest_name}</td>
+                          <td className="px-3 py-3 font-semibold text-[#0F1923]">
+                            {b.guest_name}
+                            {/* where the guest booked from */}
+                            {b.booking_channel && (
+                              <span
+                                className={`mt-1 block w-fit max-w-[160px] truncate rounded border px-1.5 py-[1px] text-[0.58rem] font-bold uppercase tracking-[0.5px] ${channelBadgeClass(
+                                  b.booking_channel
+                                )}`}
+                                title={`Booking source: ${b.booking_channel}`}
+                              >
+                                {b.booking_channel}
+                              </span>
+                            )}
+                          </td>
                           <td className="px-3 py-3 text-[0.82rem] text-[#495057]">{b.room_type}</td>
                           <td className="px-3 py-3 text-[0.82rem] text-[#495057]">{b.check_in_date?.slice(0, 10)}</td>
                           <td className="px-3 py-3 text-[0.82rem] text-[#495057]">{b.check_out_date?.slice(0, 10)}</td>
